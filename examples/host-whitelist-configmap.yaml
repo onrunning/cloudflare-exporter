@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudflare-exporter-hosts
+data:
+  hosts.yaml: |
+    hosts:
+      - www.example.com
+      - api.example.com

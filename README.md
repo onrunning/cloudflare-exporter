@@ -84,6 +84,12 @@ The exporter can be configured using env variables or command flags.
 | `ZONE_<NAME>` |  `DEPRECATED since 0.0.5` (optional) Zone ID. Add zones you want to scrape by adding env vars in this format. You can find the zone ids in Cloudflare dashboards. |
 | `LOG_LEVEL` | Set loglevel. Options are error, warn, info, debug. default `error` |
 
+### Host whitelist
+
+Set the chart value `hostWhitelist.configMapName` to an externally managed ConfigMap in the release namespace. The chart mounts only its `hosts.yaml` key read-only at `/etc/cloudflare-exporter/hosts.yaml`; it never creates the ConfigMap. See `examples/host-whitelist-configmap.yaml`.
+
+The file is reread before each scrape. It must be exactly one mapping with one `hosts` list of strings. YAML and equivalent JSON are accepted; duplicate keys, merge keys, scalar/null or multi-document input, extra keys, and invalid entries are rejected. Matching is exact and unnormalized. Before any valid whitelist is loaded, a missing or unmounted ConfigMap/file scrapes all hosts. A valid `hosts: []` also explicitly scrapes all hosts. Invalid updates retain the last valid list; after a valid non-empty whitelist has loaded, an unreadable or missing file retains that last valid whitelist. Covered paths are request analytics, firewall host analytics, colocation analytics, and edge-errors-by-path; non-host metrics are unchanged.
+
 Corresponding flags:
 
 ```
