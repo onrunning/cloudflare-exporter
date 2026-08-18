@@ -11,6 +11,8 @@ image:
   # tag: latest
 env: []
 secretRef: ""
+hostWhitelist:
+  configMapName: ""
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""

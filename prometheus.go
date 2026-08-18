@@ -378,6 +378,19 @@ var (
 	}, []string{"account"})
 )
 
+func init() {
+	hostSeriesRegistryState.Register(zoneRequestOriginStatusCountryHost, "zone", "account", "status", "country", "host")
+	hostSeriesRegistryState.Register(zoneRequestOriginStatusCountryHostP50, "zone", "account", "status", "country", "host")
+	hostSeriesRegistryState.Register(zoneRequestOriginStatusCountryHostP95, "zone", "account", "status", "country", "host")
+	hostSeriesRegistryState.Register(zoneRequestOriginStatusCountryHostP99, "zone", "account", "status", "country", "host")
+	hostSeriesRegistryState.Register(zoneRequestStatusCountryHost, "zone", "account", "status", "country", "host")
+	hostSeriesRegistryState.Register(zoneColocationVisits, "zone", "account", "colocation", "host")
+	hostSeriesRegistryState.Register(zoneColocationEdgeResponseBytes, "zone", "account", "colocation", "host")
+	hostSeriesRegistryState.Register(zoneColocationRequestsTotal, "zone", "account", "colocation", "host")
+	hostSeriesRegistryState.Register(zoneFirewallEventsCount, "zone", "account", "action", "source", "rule", "host", "country")
+	hostSeriesRegistryState.Register(zoneEdgeErrorsByPath, "zone", "account", "status", "host", "path")
+}
+
 func buildAllMetricsSet() MetricsSet {
 	allMetricsSet := MetricsSet{}
 	allMetricsSet.Add(zoneRequestTotalMetricName)
@@ -733,7 +746,7 @@ func fetchLogpushAnalyticsForZone(zones []cfzones.Zone, wg *sync.WaitGroup) {
 	}
 }
 
-func fetchZoneColocationAnalytics(zones []cfzones.Zone, wg *sync.WaitGroup) {
+func fetchZoneColocationAnalytics(zones []cfzones.Zone, snapshot hostWhitelist, registry *hostSeriesRegistry, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	// Colocation metrics are not available in non-enterprise zones
@@ -755,14 +768,39 @@ func fetchZoneColocationAnalytics(zones []cfzones.Zone, wg *sync.WaitGroup) {
 		cg := z.ColoGroups
 		name, account := findZoneAccountName(zones, z.ZoneTag)
 		for _, c := range cg {
-			zoneColocationVisits.With(prometheus.Labels{"zone": name, "account": account, "colocation": c.Dimensions.ColoCode, "host": c.Dimensions.Host}).Add(float64(c.Sum.Visits))
-			zoneColocationEdgeResponseBytes.With(prometheus.Labels{"zone": name, "account": account, "colocation": c.Dimensions.ColoCode, "host": c.Dimensions.Host}).Add(float64(c.Sum.EdgeResponseBytes))
-			zoneColocationRequestsTotal.With(prometheus.Labels{"zone": name, "account": account, "colocation": c.Dimensions.ColoCode, "host": c.Dimensions.Host}).Add(float64(c.Count))
+			addColocationGroup(c, name, account, snapshot, registry)
 		}
 	}
 }
 
-func fetchZoneAnalytics(zones []cfzones.Zone, wg *sync.WaitGroup) {
+func addColocationGroup(c struct {
+	Dimensions struct {
+		Datetime string `json:"datetime"`
+		ColoCode string `json:"coloCode"`
+		Host     string `json:"clientRequestHTTPHost"`
+	} `json:"dimensions"`
+	Count uint64 `json:"count"`
+	Sum   struct {
+		EdgeResponseBytes uint64 `json:"edgeResponseBytes"`
+		Visits            uint64 `json:"visits"`
+	} `json:"sum"`
+	Avg struct {
+		SampleInterval float64 `json:"sampleInterval"`
+	} `json:"avg"`
+}, name string, account string, snapshot hostWhitelist, registry *hostSeriesRegistry) {
+	labels := prometheus.Labels{"zone": name, "account": account, "colocation": c.Dimensions.ColoCode, "host": c.Dimensions.Host}
+	if !snapshot.Allows(labels["host"]) {
+		return
+	}
+	zoneColocationVisits.With(labels).Add(float64(c.Sum.Visits))
+	registry.Observe(zoneColocationVisits, labels)
+	zoneColocationEdgeResponseBytes.With(labels).Add(float64(c.Sum.EdgeResponseBytes))
+	registry.Observe(zoneColocationEdgeResponseBytes, labels)
+	zoneColocationRequestsTotal.With(labels).Add(float64(c.Count))
+	registry.Observe(zoneColocationRequestsTotal, labels)
+}
+
+func fetchZoneAnalytics(zones []cfzones.Zone, snapshot hostWhitelist, registry *hostSeriesRegistry, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	// None of the below referenced metrics are available in the free tier
@@ -786,9 +824,9 @@ func fetchZoneAnalytics(zones []cfzones.Zone, wg *sync.WaitGroup) {
 		z := z
 
 		addHTTPGroups(&z, name, account)
-		addFirewallGroups(&z, name, account)
+		addFirewallGroups(&z, name, account, snapshot, registry)
 		addHealthCheckGroups(&z, name, account)
-		addHTTPAdaptiveGroups(&z, name, account)
+		addHTTPAdaptiveGroups(&z, name, account, snapshot, registry)
 	}
 }
 
@@ -861,7 +899,7 @@ func addHTTPGroups(z *zoneResp, name string, account string) {
 	zoneUniquesTotal.With(prometheus.Labels{"zone": name, "account": account}).Add(float64(zt.Unique.Uniques))
 }
 
-func addFirewallGroups(z *zoneResp, name string, account string) {
+func addFirewallGroups(z *zoneResp, name string, account string, snapshot hostWhitelist, registry *hostSeriesRegistry) {
 	// Nothing to do.
 	if len(z.FirewallEventsAdaptiveGroups) == 0 {
 		return
@@ -872,17 +910,26 @@ func addFirewallGroups(z *zoneResp, name string, account string) {
 	zoneFirewallEventsCount.DeletePartialMatch(label)
 
 	rulesMap := fetchFirewallRules(z.ZoneTag)
+	addFirewallGroupsWithRules(z, name, account, snapshot, registry, rulesMap)
+}
+
+func addFirewallGroupsWithRules(z *zoneResp, name string, account string, snapshot hostWhitelist, registry *hostSeriesRegistry, rulesMap map[string]string) {
 	for _, g := range z.FirewallEventsAdaptiveGroups {
+		if !snapshot.Allows(g.Dimensions.ClientRequestHTTPHost) {
+			continue
+		}
+		labels := prometheus.Labels{
+			"zone":    name,
+			"account": account,
+			"action":  g.Dimensions.Action,
+			"source":  g.Dimensions.Source,
+			"rule":    normalizeRuleName(rulesMap[g.Dimensions.RuleID]),
+			"host":    g.Dimensions.ClientRequestHTTPHost,
+			"country": g.Dimensions.ClientCountryName,
+		}
 		zoneFirewallEventsCount.With(
-			prometheus.Labels{
-				"zone":    name,
-				"account": account,
-				"action":  g.Dimensions.Action,
-				"source":  g.Dimensions.Source,
-				"rule":    normalizeRuleName(rulesMap[g.Dimensions.RuleID]),
-				"host":    g.Dimensions.ClientRequestHTTPHost,
-				"country": g.Dimensions.ClientCountryName,
-			}).Add(float64(g.Count))
+			labels).Add(float64(g.Count))
+		registry.Observe(zoneFirewallEventsCount, labels)
 	}
 }
 
@@ -917,66 +964,50 @@ func addHealthCheckGroups(z *zoneResp, name string, account string) {
 	}
 }
 
-func addHTTPAdaptiveGroups(z *zoneResp, name string, account string) {
+func addHTTPAdaptiveGroups(z *zoneResp, name string, account string, snapshot hostWhitelist, registry *hostSeriesRegistry) {
 	// Clear stale series for this zone/account
-	label := prometheus.Labels{"zone": name, "account": account}
-	zoneRequestOriginStatusCountryHost.DeletePartialMatch(label)
-	zoneRequestOriginStatusCountryHostP50.DeletePartialMatch(label)
-	zoneRequestOriginStatusCountryHostP95.DeletePartialMatch(label)
-	zoneRequestOriginStatusCountryHostP99.DeletePartialMatch(label)
-	zoneRequestStatusCountryHost.DeletePartialMatch(label)
 
 	for _, g := range z.HTTPRequestsAdaptiveGroups {
-		zoneRequestOriginStatusCountryHost.With(
-			prometheus.Labels{
-				"zone":    name,
-				"account": account,
-				"status":  strconv.Itoa(int(g.Dimensions.OriginResponseStatus)),
-				"country": g.Dimensions.ClientCountryName,
-				"host":    g.Dimensions.ClientRequestHTTPHost,
-			}).Add(float64(g.Count))
+		labels := prometheus.Labels{
+			"zone":    name,
+			"account": account,
+			"status":  strconv.Itoa(int(g.Dimensions.OriginResponseStatus)),
+			"country": g.Dimensions.ClientCountryName,
+			"host":    g.Dimensions.ClientRequestHTTPHost,
+		}
+		if !snapshot.Allows(labels["host"]) {
+			continue
+		}
+		zoneRequestOriginStatusCountryHost.With(labels).Add(float64(g.Count))
+		registry.Observe(zoneRequestOriginStatusCountryHost, labels)
 
-		zoneRequestOriginStatusCountryHostP50.With(
-			prometheus.Labels{
-				"zone":    name,
-				"account": account,
-				"status":  strconv.Itoa(int(g.Dimensions.OriginResponseStatus)),
-				"country": g.Dimensions.ClientCountryName,
-				"host":    g.Dimensions.ClientRequestHTTPHost,
-			}).Set(float64(g.Quantile.OriginResponseDurationMsP50))
+		zoneRequestOriginStatusCountryHostP50.With(labels).Set(float64(g.Quantile.OriginResponseDurationMsP50))
+		registry.Observe(zoneRequestOriginStatusCountryHostP50, labels)
 
-		zoneRequestOriginStatusCountryHostP95.With(
-			prometheus.Labels{
-				"zone":    name,
-				"account": account,
-				"status":  strconv.Itoa(int(g.Dimensions.OriginResponseStatus)),
-				"country": g.Dimensions.ClientCountryName,
-				"host":    g.Dimensions.ClientRequestHTTPHost,
-			}).Set(float64(g.Quantile.OriginResponseDurationMsP95))
+		zoneRequestOriginStatusCountryHostP95.With(labels).Set(float64(g.Quantile.OriginResponseDurationMsP95))
+		registry.Observe(zoneRequestOriginStatusCountryHostP95, labels)
 
-		zoneRequestOriginStatusCountryHostP99.With(
-			prometheus.Labels{
-				"zone":    name,
-				"account": account,
-				"status":  strconv.Itoa(int(g.Dimensions.OriginResponseStatus)),
-				"country": g.Dimensions.ClientCountryName,
-				"host":    g.Dimensions.ClientRequestHTTPHost,
-			}).Set(float64(g.Quantile.OriginResponseDurationMsP99))
+		zoneRequestOriginStatusCountryHostP99.With(labels).Set(float64(g.Quantile.OriginResponseDurationMsP99))
+		registry.Observe(zoneRequestOriginStatusCountryHostP99, labels)
 	}
 
 	for _, g := range z.HTTPRequestsEdgeCountryHost {
-		zoneRequestStatusCountryHost.With(
-			prometheus.Labels{
-				"zone":    name,
-				"account": account,
-				"status":  strconv.Itoa(int(g.Dimensions.EdgeResponseStatus)),
-				"country": g.Dimensions.ClientCountryName,
-				"host":    g.Dimensions.ClientRequestHTTPHost,
-			}).Add(float64(g.Count))
+		labels := prometheus.Labels{
+			"zone":    name,
+			"account": account,
+			"status":  strconv.Itoa(int(g.Dimensions.EdgeResponseStatus)),
+			"country": g.Dimensions.ClientCountryName,
+			"host":    g.Dimensions.ClientRequestHTTPHost,
+		}
+		if !snapshot.Allows(labels["host"]) {
+			continue
+		}
+		zoneRequestStatusCountryHost.With(labels).Add(float64(g.Count))
+		registry.Observe(zoneRequestStatusCountryHost, labels)
 	}
 }
 
-func fetchEdgeErrorsByPathAnalytics(zones []cfzones.Zone, wg *sync.WaitGroup) {
+func fetchEdgeErrorsByPathAnalytics(zones []cfzones.Zone, snapshot hostWhitelist, registry *hostSeriesRegistry, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	if !viper.GetBool("enable_edge_errors_by_path") {
@@ -1000,11 +1031,11 @@ func fetchEdgeErrorsByPathAnalytics(zones []cfzones.Zone, wg *sync.WaitGroup) {
 
 	for _, z := range r.Viewer.Zones {
 		name, account := findZoneAccountName(zones, z.ZoneTag)
-		addEdgeErrorsByPath(&z, name, account)
+		addEdgeErrorsByPath(&z, name, account, snapshot, registry)
 	}
 }
 
-func addEdgeErrorsByPath(z *zoneRespEdgeErrorsByPath, name string, account string) {
+func addEdgeErrorsByPath(z *zoneRespEdgeErrorsByPath, name string, account string, snapshot hostWhitelist, registry *hostSeriesRegistry) {
 	if len(z.HTTPRequestsAdaptiveGroups) == 0 {
 		return
 	}
@@ -1013,14 +1044,18 @@ func addEdgeErrorsByPath(z *zoneRespEdgeErrorsByPath, name string, account strin
 	zoneEdgeErrorsByPath.DeletePartialMatch(label)
 
 	for _, g := range z.HTTPRequestsAdaptiveGroups {
-		zoneEdgeErrorsByPath.With(
-			prometheus.Labels{
-				"zone":    name,
-				"account": account,
-				"status":  strconv.Itoa(int(g.Dimensions.EdgeResponseStatus)),
-				"host":    g.Dimensions.ClientRequestHTTPHost,
-				"path":    normalizePath(g.Dimensions.ClientRequestPath),
-			}).Add(float64(g.Count))
+		labels := prometheus.Labels{
+			"zone":    name,
+			"account": account,
+			"status":  strconv.Itoa(int(g.Dimensions.EdgeResponseStatus)),
+			"host":    g.Dimensions.ClientRequestHTTPHost,
+			"path":    normalizePath(g.Dimensions.ClientRequestPath),
+		}
+		if !snapshot.Allows(labels["host"]) {
+			continue
+		}
+		zoneEdgeErrorsByPath.With(labels).Add(float64(g.Count))
+		registry.Observe(zoneEdgeErrorsByPath, labels)
 	}
 }
 

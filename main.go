@@ -20,10 +20,13 @@ import (
 )
 
 var (
-	cfclient  *cf.Client
-	cftimeout time.Duration
-	gql       *GraphQL
-	log       = logrus.New()
+	cfclient              *cf.Client
+	cftimeout             time.Duration
+	gql                   *GraphQL
+	log                   = logrus.New()
+	hostWhitelistSnapshot = emptyHostWhitelist()
+	hostWhitelistMu       sync.Mutex
+	scrapeMu              sync.Mutex
 )
 
 // var (
@@ -112,29 +115,30 @@ func filterExcludedZones(all []cfzones.Zone, exclude []string) []cfzones.Zone {
 	return filtered
 }
 
-func fetchMetrics() {
-	var wg sync.WaitGroup
+type metricsCollectorRunner func(snapshot hostWhitelist, wg *sync.WaitGroup)
+
+func runMetricsCollectors(snapshot hostWhitelist, wg *sync.WaitGroup) {
 	targetAccounts := getTargetAccounts()
 	accounts := fetchAccounts(targetAccounts)
 
 	for _, a := range accounts {
 		wg.Add(1)
-		go fetchWorkerAnalytics(a, &wg)
+		go fetchWorkerAnalytics(a, wg)
 
 		wg.Add(1)
-		go fetchLogpushAnalyticsForAccount(a, &wg)
+		go fetchLogpushAnalyticsForAccount(a, wg)
 
 		wg.Add(1)
-		go fetchR2StorageForAccount(a, &wg)
+		go fetchR2StorageForAccount(a, wg)
 
 		wg.Add(1)
-		go fetchLoadblancerPoolsHealth(a, &wg)
+		go fetchLoadblancerPoolsHealth(a, wg)
 
 		wg.Add(1)
-		go fetchZeroTrustAnalyticsForAccount(a, &wg)
+		go fetchZeroTrustAnalyticsForAccount(a, wg)
 
 		wg.Add(1)
-		go fetchAccountHTTPDataTransferAnalytics(a, &wg)
+		go fetchAccountHTTPDataTransferAnalytics(a, wg)
 	}
 
 	zones := fetchZones(accounts)
@@ -149,22 +153,22 @@ func fetchMetrics() {
 	zoneCount := len(filteredZones)
 	if zoneCount > 0 && zoneCount <= cfgraphqlreqlimit {
 		wg.Add(1)
-		go fetchZoneAnalytics(filteredZones, &wg)
+		go fetchZoneAnalytics(filteredZones, snapshot, hostSeriesRegistryState, wg)
 
 		wg.Add(1)
-		go fetchZoneColocationAnalytics(filteredZones, &wg)
+		go fetchZoneColocationAnalytics(filteredZones, snapshot, hostSeriesRegistryState, wg)
 
 		wg.Add(1)
-		go fetchLoadBalancerAnalytics(filteredZones, &wg)
+		go fetchLoadBalancerAnalytics(filteredZones, wg)
 
 		wg.Add(1)
-		go fetchLogpushAnalyticsForZone(filteredZones, &wg)
+		go fetchLogpushAnalyticsForZone(filteredZones, wg)
 
 		wg.Add(1)
-		go fetchZoneASNAnalytics(filteredZones, &wg)
+		go fetchZoneASNAnalytics(filteredZones, wg)
 
 		wg.Add(1)
-		go fetchEdgeErrorsByPathAnalytics(filteredZones, &wg)
+		go fetchEdgeErrorsByPathAnalytics(filteredZones, snapshot, hostSeriesRegistryState, wg)
 	} else if zoneCount > cfgraphqlreqlimit {
 		for s := 0; s < zoneCount; s += cfgraphqlreqlimit {
 			e := s + cfgraphqlreqlimit
@@ -172,26 +176,43 @@ func fetchMetrics() {
 				e = zoneCount
 			}
 			wg.Add(1)
-			go fetchZoneAnalytics(filteredZones[s:e], &wg)
+			go fetchZoneAnalytics(filteredZones[s:e], snapshot, hostSeriesRegistryState, wg)
 
 			wg.Add(1)
-			go fetchZoneColocationAnalytics(filteredZones[s:e], &wg)
+			go fetchZoneColocationAnalytics(filteredZones[s:e], snapshot, hostSeriesRegistryState, wg)
 
 			wg.Add(1)
-			go fetchLoadBalancerAnalytics(filteredZones[s:e], &wg)
+			go fetchLoadBalancerAnalytics(filteredZones[s:e], wg)
 
 			wg.Add(1)
-			go fetchLogpushAnalyticsForZone(filteredZones[s:e], &wg)
+			go fetchLogpushAnalyticsForZone(filteredZones[s:e], wg)
 
 			wg.Add(1)
-			go fetchZoneASNAnalytics(filteredZones[s:e], &wg)
+			go fetchZoneASNAnalytics(filteredZones[s:e], wg)
 
 			wg.Add(1)
-			go fetchEdgeErrorsByPathAnalytics(filteredZones[s:e], &wg)
+			go fetchEdgeErrorsByPathAnalytics(filteredZones[s:e], snapshot, hostSeriesRegistryState, wg)
 		}
 	}
+}
 
+func fetchMetricsWithRunner(run metricsCollectorRunner) {
+	scrapeMu.Lock()
+	defer scrapeMu.Unlock()
+
+	hostWhitelistMu.Lock()
+	hostWhitelistSnapshot = loadHostWhitelist(viper.GetString("host_whitelist_path"), hostWhitelistSnapshot)
+	snapshot := hostWhitelistSnapshot
+	hostWhitelistMu.Unlock()
+	hostSeriesRegistryState.ResetScrape()
+	var wg sync.WaitGroup
+	run(snapshot, &wg)
 	wg.Wait()
+	hostSeriesRegistryState.Reconcile()
+}
+
+func fetchMetrics() {
+	fetchMetricsWithRunner(runMetricsCollectors)
 }
 
 func runExporter() {
@@ -221,8 +242,11 @@ func runExporter() {
 	log.Info("Scrape interval set to ", scrapeInterval)
 
 	go func() {
-		for ; true; <-time.NewTicker(scrapeInterval).C {
-			go fetchMetrics()
+		fetchMetrics()
+		ticker := time.NewTicker(scrapeInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			fetchMetrics()
 		}
 	}()
 
@@ -266,6 +290,7 @@ func main() {
 	flags.String("metrics_path", "/metrics", "path for metrics, default /metrics")
 	viper.BindEnv("metrics_path")
 	viper.SetDefault("metrics_path", "/metrics")
+	viper.SetDefault("host_whitelist_path", hostWhitelistPath)
 
 	flags.String("cf_api_key", "", "cloudflare api key, required with api_email flag")
 	viper.BindEnv("cf_api_key")

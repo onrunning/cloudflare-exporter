@@ -23,6 +23,7 @@ The following table lists the configurable parameters of the Cloudflare-exporter
 | `image.tag` |  | `"0.0.2"` |
 | `env` |  | `[]` |
 | `secretRef` | The name of a secret with environment variables | `""` |
+| `hostWhitelist.configMapName` | External ConfigMap containing the `hosts.yaml` whitelist key | `""` |
 | `imagePullSecrets` |  | `[]` |
 | `nameOverride` |  | `""` |
 | `fullnameOverride` |  | `""` |
@@ -49,6 +50,8 @@ The following table lists the configurable parameters of the Cloudflare-exporter
 | `nodeSelector` |  | `{}` |
 | `tolerations` |  | `[]` |
 | `affinity` |  | `{}` |
+
+When configured, the operator must create `hostWhitelist.configMapName` in the release namespace. The chart projects only `hosts.yaml` read-only into `/etc/cloudflare-exporter`; it does not create or own a ConfigMap. The runtime default path is `/etc/cloudflare-exporter/hosts.yaml`. Before any valid whitelist is loaded, a missing or unmounted ConfigMap means scrape all hosts. A valid `hosts: []` also means scrape all hosts. After a valid non-empty whitelist is loaded, an unreadable or missing file retains the last valid whitelist. See `examples/host-whitelist-configmap.yaml`, `ci/host-whitelist-values.yaml`, and `ci/assert-host-whitelist-render.sh`.
 
 
 
